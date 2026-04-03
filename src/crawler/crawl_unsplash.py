@@ -29,13 +29,13 @@ from src.storage.mongodb_client import MongoDBClient
 BASE_URL = "https://api.unsplash.com/search/photos"
 HEADERS  = {"Authorization": f"Client-ID {UNSPLASH_KEY}"}
 PER_PAGE = 30
-TARGET   = 5000
+TARGET   = 7000
 MAX_WORKERS = 8  # concurrent download/upload workers
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF = 2.0
 
 KEYWORDS = [
-    "forest", "sea", "desert", "snow"
+    "mountain", "forest", "sea", "desert", "snow"
 ]
 # ================================================================
 
