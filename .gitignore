@@ -1,0 +1,27 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environment
+.venv/
+
+# VS Code
+.vscode/
+
+# Logs
+*.log
+logs/
+
+# Data and large files
+data/dataset_raw/
+data/processed/
+data/**/raw/
+data
+
+# MinIO local data (if you mount a host dir)
+minio_data/
+
+# Environments
+.env
+
