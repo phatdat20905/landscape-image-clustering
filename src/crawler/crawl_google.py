@@ -380,6 +380,15 @@ def crawl_google_images(
                 
                 if url in downloaded:
                     continue
+
+                # Skip if this URL already exists in MongoDB (avoid re-downloading same image across runs)
+                try:
+                    if url and url.startswith("http") and col.find_one({"url": url, "source": "google"}):
+                        print(f"      [{url_idx+1}/{len(all_urls)}] [SKIP] already in DB")
+                        continue
+                except Exception:
+                    # If MongoDB check fails for any reason, proceed to attempt download
+                    pass
                 
                 print(f"      [{url_idx+1}/{len(all_urls)}] ", end="")
                 
