@@ -12,7 +12,7 @@ class MongoDBClient:
         # Kết nối MongoDB Atlas
         self.client = MongoClient(
             MONGO_URI,
-            serverSelectionTimeoutMS=5000
+            #serverSelectionTimeoutMS=5000
         )
 
         try:

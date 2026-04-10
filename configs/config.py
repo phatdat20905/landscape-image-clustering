@@ -23,6 +23,8 @@ MONGO_DB  = os.getenv("MONGO_DB")
 MONGO_COLLECTIONS = {
     "raw": "images_raw",
     "clean": "images_clean",
+    "integrated": "images_integrated",
+    "transformed": "images_transformed",
     "features": "image_features",
     "clusters": "clusters"
 }
