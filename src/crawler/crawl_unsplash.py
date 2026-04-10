@@ -24,18 +24,19 @@ from configs.config import (
 
 from src.storage.minio_client   import MinioClient
 from src.storage.mongodb_client import MongoDBClient
+from pymongo import ReturnDocument
 
 # ================================================================
 BASE_URL = "https://api.unsplash.com/search/photos"
 HEADERS  = {"Authorization": f"Client-ID {UNSPLASH_KEY}"}
 PER_PAGE = 30
-TARGET   = 7000
+TARGET   = 5200
 MAX_WORKERS = 8  # concurrent download/upload workers
 RETRY_ATTEMPTS = 3
 RETRY_BACKOFF = 2.0
 
 KEYWORDS = [
-    "mountain", "forest", "sea", "desert", "snow"
+    "snow"
 ]
 # ================================================================
 
@@ -98,13 +99,50 @@ def crawl_unsplash(minio: MinioClient, mongo: MongoDBClient, target=TARGET):
 
     # 👉 resume theo source
     count = col.count_documents({"source": "unsplash"})
-    print(f"[Unsplash] Đã có {count} ảnh | Target: {target}")
+
+    # Determine highest existing filename index (unsplash_######.jpg)
+    max_id = 0
+    try:
+        cursor = col.find({"source": "unsplash", "filename": {"$regex": r"^unsplash_\d{6}\.jpg$"}}, {"filename": 1}).sort("filename", -1).limit(1)
+        first = next(cursor, None)
+        if first:
+            fn = first.get("filename", "")
+            try:
+                max_id = int(fn.split('_')[1].split('.')[0])
+            except Exception:
+                max_id = count
+    except Exception:
+        max_id = count
+
+    # Ensure an atomic counter exists in Mongo and is at least max_id
+    try:
+        counters = mongo.db['counters']
+        cur = counters.find_one({'_id': 'unsplash'})
+        if cur is None:
+            counters.insert_one({'_id': 'unsplash', 'seq': max_id})
+        else:
+            if int(cur.get('seq', 0)) < max_id:
+                counters.update_one({'_id': 'unsplash'}, {'$set': {'seq': max_id}})
+    except Exception:
+        # ignore and fallback to in-process counter
+        pass
+
+    print(f"[Unsplash] Đã có {count} ảnh | max filename id: {max_id} | Target: {target}")
 
     # Tạo session chung (reuse TCP connections)
     session = requests.Session()
     session.headers.update(HEADERS)
     
+    # Local counter as fallback
     counter_mgr = CounterManager(count)
+
+    def get_next_sequence(name: str = 'unsplash') -> int:
+        try:
+            coll = mongo.db['counters']
+            doc = coll.find_one_and_update({'_id': name}, {'$inc': {'seq': 1}}, upsert=True, return_document=ReturnDocument.AFTER)
+            return int(doc['seq'])
+        except Exception:
+            return counter_mgr.get_next()
 
     for keyword in KEYWORDS:
         if count >= target:
@@ -176,8 +214,8 @@ def crawl_unsplash(minio: MinioClient, mongo: MongoDBClient, target=TARGET):
                 if not is_valid:
                     return None
 
-                # Reserve a thread-safe id for the filename
-                next_id = counter_mgr.get_next()
+                # Reserve an atomic id for the filename (preferred) or fallback to local counter
+                next_id = get_next_sequence('unsplash')
                 filename = f"unsplash_{next_id:06d}.jpg"
                 object_name = f"raw/images/{filename}"
 
@@ -201,7 +239,7 @@ def crawl_unsplash(minio: MinioClient, mongo: MongoDBClient, target=TARGET):
                     "keyword": keyword,
                     "width": int(w),
                     "height": int(h),
-                    "crawled_at": datetime.now(timezone.utc).isoformat()
+                    "crawled_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 }
 
                 try:

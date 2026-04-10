@@ -183,7 +183,7 @@ def crawl_pexels(minio: MinioClient, mongo: MongoDBClient, target=TARGET):
                     "keyword": keyword,
                     "width": photo.get("width", 0),
                     "height": photo.get("height", 0),
-                    "crawled_at": datetime.now(timezone.utc).isoformat()
+                    "crawled_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
                 }
 
                 try:

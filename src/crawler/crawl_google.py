@@ -429,7 +429,7 @@ def crawl_google_images(
                     "description": f"{keyword} landscape",
                     "width": w,
                     "height": h,
-                    "crawled_at": datetime.now().isoformat(),
+                    "crawled_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 }
                 
                 saved = save_to_mongodb(mongo, "raw", metadata)
