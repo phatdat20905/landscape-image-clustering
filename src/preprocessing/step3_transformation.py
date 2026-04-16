@@ -3,105 +3,188 @@
 #  STEP 3 – DATA TRANSFORMATION
 #  Workflow: Integration → [Transformation] → Encoding
 #
-#  Kỹ thuật:
-#    1. Tải ảnh từ raw/images/{stem}
-#    2. Resize 640×640 PNG (letter-box, LANCZOS)
-#    3. Histogram Equalization (cân bằng ánh sáng kênh Y)
-#    4. Normalization stats (mean/std RGB → lưu vào MongoDB)
-#    5. Augmentation (Flip, Rotate, Brightness, Crop, Noise)
+#  Pipeline 3 bước (theo test2.py):
 #
-#  Input : MinIO raw/images/{stem}
-#          MongoDB images_integrated (integrated=True)
-#  Output: MinIO preprocessed/images/{keyword}/{stem}.png
-#          MinIO preprocessed/images/{keyword}/{stem}_aug1.png ...
-#          MongoDB images_transformed:
-#          {filename, keyword, source, transform_object_name,
-#           aug_object_names, width=640, height=640, format=PNG,
-#           norm_mean_*, norm_std_*, norm_brightness, transformed_at}
+#    standard_pipeline:
+#      LongestMaxSize(640) → PadIfNeeded(640×640, fill=114) → CLAHE
+#    aug_pipeline  (áp dụng lên ảnh standard):
+#      GaussianBlur → HorizontalFlip → RandomBrightnessContrast
+#    final_norm    (dùng ở step4 khi đưa vào model):
+#      Normalize(ImageNet mean/std) → ToTensorV2
+#      (KHÔNG áp dụng ở step3, chỉ lưu PNG gốc)
 #
-#  Chạy: python src/preprocessing/step3_transformation.py
+#  Kết quả lưu trên MinIO:
+#    preprocessed/images/{label}/{stem}.png      ← ảnh standard
+#    preprocessed/images/{label}/{stem}_aug1.png ← ảnh augmented
+#    preprocessed/images/{label}/{stem}_aug2.png
+#
+#  Resume:
+#    Index unique (source_filename, aug_index) trong images_transformed
+#    → dừng bất cứ lúc nào, chạy tiếp không bị trùng.
+#
+#  Input : MongoDB images_integrated
+#          MinIO raw/images/{filename}
+#  Output: MongoDB images_transformed
+#          MinIO preprocessed/images/{label}/
+#
+#  Cài  : pip install albumentations opencv-python pillow
+#  Chạy : python src/preprocessing/step3_transformation.py
 # ================================================================
 
-import sys, os, io, random
+import sys, os, io
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 import cv2
 import numpy as np
-from PIL import Image, ImageEnhance
 from datetime import datetime
+from pymongo import ASCENDING
+
+import albumentations as A
+from albumentations.pytorch import ToTensorV2
 
 from src.storage.minio_client   import MinioClient
 from src.storage.mongodb_client import MongoDBClient
 from configs.config import MINIO_BUCKET
 
-# ── Config ──────────────────────────────────────────────────────
-TARGET_SIZE       = (640, 640)
-RAW_PREFIX        = "raw/images"              # nguồn ảnh gốc
-PREPROC_PREFIX    = "preprocessed/images"    # đích sau transform
+# ── Config ────────────────────────────────────────────────────────
+TARGET_SIZE       = 640
+PAD_FILL          = 114          # gray padding – chuẩn ImageNet/YOLO
+RAW_PREFIX        = "raw/images"
+PREPROC_PREFIX    = "preprocessed/images"
 AUGMENT_ENABLED   = True
-AUGMENT_PER_IMAGE = 2
-HIST_EQ_ENABLED   = True
+AUGMENT_PER_IMAGE = 1
+
+
+# ================================================================
+#  PIPELINES ALBUMENTATIONS  (cấu trúc giống test2.py)
+# ================================================================
+
+def get_standard_pipeline(target_size: int = TARGET_SIZE) -> A.Compose:
+    """
+    Pipeline chuẩn cho ảnh gốc (không blur):
+      1. LongestMaxSize   – scale xuống sao cho cạnh dài ≤ target_size
+      2. PadIfNeeded      – pad bằng màu xám (114) về đúng target×target
+      3. CLAHE            – tăng tương phản cục bộ (tốt hơn globalHistEQ)
+
+    Tương ứng test2.py:
+        standard_pipeline = A.Compose([
+            A.LongestMaxSize(max_size=target_size),
+            A.PadIfNeeded(min_height=..., min_width=..., border_mode=0, fill=114),
+            A.CLAHE(clip_limit=2.0, p=1.0),
+        ])
+    """
+    return A.Compose([
+        A.LongestMaxSize(max_size=target_size),
+        A.PadIfNeeded(
+            min_height=target_size,
+            min_width=target_size,
+            border_mode=cv2.BORDER_CONSTANT,
+            fill=PAD_FILL,
+        ),
+        A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=1.0),
+    ])
+
+
+def get_aug_pipeline() -> A.Compose:
+    """
+    Pipeline augmentation (áp dụng lên ảnh standard):
+      1. GaussianBlur          – làm mờ nhẹ, tăng robustness noise
+      2. HorizontalFlip        – lật ngang ngẫu nhiên
+      3. RandomBrightnessContrast – đa dạng ánh sáng
+
+    Tương ứng test2.py:
+        aug_pipeline = A.Compose([
+            A.GaussianBlur(blur_limit=(3, 7), p=1.0),
+            A.HorizontalFlip(p=0.5),
+            A.RandomBrightnessContrast(p=0.3),
+        ])
+    """
+    return A.Compose([
+        A.GaussianBlur(blur_limit=(3, 7), p=0.8),
+        A.HorizontalFlip(p=0.5),
+        A.RandomBrightnessContrast(
+            brightness_limit=0.25,
+            contrast_limit=0.25,
+            p=0.6,
+        ),
+        # Thêm augmentation nâng cao
+        A.HueSaturationValue(
+            hue_shift_limit=10,
+            sat_shift_limit=20,
+            val_shift_limit=10,
+            p=0.4,
+        ),
+        A.RandomResizedCrop(
+            size=(TARGET_SIZE, TARGET_SIZE),
+            scale=(0.8, 1.0),
+            ratio=(0.9, 1.1),
+            p=0.4,
+        ),
+    ])
+
+
+def get_final_norm_pipeline() -> A.Compose:
+    """
+    Pipeline chuẩn hoá cuối cùng để đưa vào model (step4).
+    KHÔNG dùng ở step3 – chỉ export để step4 import.
+
+    Tương ứng test2.py:
+        final_norm = A.Compose([
+            A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225)),
+            AT.ToTensorV2()
+        ])
+    """
+    return A.Compose([
+        A.Normalize(
+            mean=(0.485, 0.456, 0.406),
+            std=(0.229, 0.224, 0.225),
+        ),
+        ToTensorV2(),
+    ])
+
+
+# Khởi tạo pipeline 1 lần
+STANDARD_PIPELINE = get_standard_pipeline(TARGET_SIZE)
+AUG_PIPELINE      = get_aug_pipeline()
 
 
 # ================================================================
 #  HELPERS
 # ================================================================
-def resize_640(pil_img: Image.Image) -> Image.Image:
-    """Resize → 640×640, giữ aspect ratio + letter-box trắng."""
-    img = pil_img.copy()
-    img.thumbnail(TARGET_SIZE, Image.LANCZOS)
-    padded = Image.new("RGB", TARGET_SIZE, (255, 255, 255))
-    ox = (TARGET_SIZE[0] - img.width)  // 2
-    oy = (TARGET_SIZE[1] - img.height) // 2
-    padded.paste(img, (ox, oy))
-    return padded
-
-
-def hist_equalization(pil_img: Image.Image) -> Image.Image:
-    """Cân bằng ánh sáng kênh Y trong YCbCr."""
-    ycbcr    = pil_img.convert("YCbCr")
-    y, cb, cr = ycbcr.split()
-    y_eq     = Image.fromarray(cv2.equalizeHist(np.array(y)))
-    return Image.merge("YCbCr", (y_eq, cb, cr)).convert("RGB")
-
-
-def compute_norm_stats(pil_img: Image.Image) -> dict:
-    """Tính mean/std RGB → lưu MongoDB, dùng Z-score ở Encoding."""
-    arr = np.array(pil_img, dtype=np.float32)
+def compute_norm_stats(img_rgb: np.ndarray) -> dict:
+    """Tính mean/std RGB từ ảnh uint8 [0,255]. Lưu MongoDB."""
+    f = img_rgb.astype(np.float32)
     return {
-        "norm_mean_r": round(float(arr[:,:,0].mean()), 4),
-        "norm_mean_g": round(float(arr[:,:,1].mean()), 4),
-        "norm_mean_b": round(float(arr[:,:,2].mean()), 4),
-        "norm_std_r":  round(float(arr[:,:,0].std()),  4),
-        "norm_std_g":  round(float(arr[:,:,1].std()),  4),
-        "norm_std_b":  round(float(arr[:,:,2].std()),  4),
-        "norm_brightness": round(float(np.array(pil_img.convert("L")).mean()), 4),
+        "norm_mean_r":     round(float(f[:, :, 0].mean()), 4),
+        "norm_mean_g":     round(float(f[:, :, 1].mean()), 4),
+        "norm_mean_b":     round(float(f[:, :, 2].mean()), 4),
+        "norm_std_r":      round(float(f[:, :, 0].std()),  4),
+        "norm_std_g":      round(float(f[:, :, 1].std()),  4),
+        "norm_std_b":      round(float(f[:, :, 2].std()),  4),
+        "norm_brightness": round(float(
+            cv2.cvtColor(img_rgb, cv2.COLOR_RGB2GRAY).astype(np.float32).mean()
+        ), 4),
     }
 
 
-def augment_one(pil_img: Image.Image) -> Image.Image:
-    """Sinh 1 biến thể: Flip, Rotate, Brightness, Crop, Noise."""
-    img = pil_img.copy()
-    if random.random() > 0.5:
-        img = img.transpose(Image.FLIP_LEFT_RIGHT)
-    img = img.rotate(random.uniform(-30, 30), resample=Image.BILINEAR)
-    img = ImageEnhance.Brightness(img).enhance(random.uniform(0.7, 1.3))
-    w, h = img.size
-    cr   = random.uniform(0.8, 1.0)
-    cw, ch = int(w*cr), int(h*cr)
-    l = random.randint(0, w-cw); t = random.randint(0, h-ch)
-    img = img.crop((l, t, l+cw, t+ch)).resize(TARGET_SIZE, Image.LANCZOS)
-    if random.random() > 0.5:
-        arr   = np.array(img, dtype=np.float32)
-        noise = np.random.normal(0, random.uniform(0, 10), arr.shape)
-        img   = Image.fromarray(np.clip(arr+noise, 0, 255).astype(np.uint8))
-    return img
+def load_rgb_from_minio(minio: MinioClient, object_name: str) -> np.ndarray:
+    """Tải ảnh từ MinIO → NumPy RGB uint8."""
+    resp = minio.client.get_object(MINIO_BUCKET, object_name)
+    raw  = resp.read(); resp.close()
+    arr  = np.frombuffer(raw, np.uint8)
+    bgr  = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+    if bgr is None:
+        raise ValueError(f"cv2.imdecode thất bại: {object_name}")
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
 
 
-def to_png_bytes(pil_img: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    pil_img.save(buf, format="PNG", optimize=False)
-    return buf.getvalue()
+def rgb_to_png_bytes(img_rgb: np.ndarray) -> bytes:
+    """RGB → PNG bytes in-memory."""
+    bgr = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2BGR)
+    ok, buf = cv2.imencode(".png", bgr)
+    if not ok:
+        raise RuntimeError("cv2.imencode thất bại")
+    return buf.tobytes()
 
 
 def upload_png(minio: MinioClient, obj_name: str, png_bytes: bytes) -> bool:
@@ -113,166 +196,178 @@ def upload_png(minio: MinioClient, obj_name: str, png_bytes: bytes) -> bool:
     )
 
 
+def build_doc(fname_out: str, obj_name: str, label: str,
+              orig_w: int, orig_h: int, norm: dict,
+              is_aug: bool, aug_idx: int | None,
+              ) -> dict:
+    return {
+        "filename":        fname_out,
+        "label":           label,
+        "object_name":     obj_name,
+        "width_raw":       orig_w,
+        "height_raw":      orig_h,
+        "width":           TARGET_SIZE,
+        "height":          TARGET_SIZE,
+        "format":          "PNG",
+        "is_augmented":    is_aug,
+        "aug_index":       aug_idx,
+        "transformed":     True,
+        "transformed_at":  datetime.now().strftime("%Y-%m-%d"),
+        **norm,
+    }
+
+
 # ================================================================
 #  MAIN
 # ================================================================
 def run_transformation(minio: MinioClient, mongo: MongoDBClient):
-    col_integrated = mongo.get_col("integrated")
+    col_integrated  = mongo.get_col("integrated")
     col_transformed = mongo.get_col("transformed")
-    # Ensure unique index on object_name so we can detect already-processed objects
+
+    # ── Index để resume ──────────────────────────────────────────
     try:
-        col_transformed.create_index([("object_name", 1)], unique=True)
+        col_transformed.create_index(
+            [("filename", ASCENDING), ("aug_index", ASCENDING)],
+            unique=True, name="src_aug_unique",
+        )
+        col_transformed.create_index([("label",        ASCENDING)])
+        col_transformed.create_index([("is_augmented", ASCENDING)])
     except Exception:
         pass
 
-    query = {"integrated": True, "transformed": {"$ne": True}}
-    total = col_integrated.count_documents(query)
-    print(f"[Transformation] Ảnh cần transform: {total:,}")
-    print(f"  Resize  : {TARGET_SIZE[0]}×{TARGET_SIZE[1]} PNG")
-    print(f"  HistEQ  : {'ON' if HIST_EQ_ENABLED else 'OFF'}")
-    print(f"  Augment : {'ON ×'+str(AUGMENT_PER_IMAGE) if AUGMENT_ENABLED else 'OFF'}")
-    print(f"  Input   : {RAW_PREFIX}/{{stem}}")
-    print(f"  Output  : {PREPROC_PREFIX}/{{label}}/")
+    total = col_integrated.count_documents({})
+    print(f"[Transformation] Tổng integrated: {total:,}")
+    print(f"  standard_pipeline: LongestMaxSize({TARGET_SIZE}) → PadIfNeeded(fill={PAD_FILL}) → CLAHE")
+    print(f"  aug_pipeline     : GaussianBlur → HFlip → BrightnessContrast → HSV → RndCrop")
+    print(f"  AUGMENT_PER_IMAGE: {AUGMENT_PER_IMAGE}")
+    print(f"  Output MinIO     : {PREPROC_PREFIX}/{{label}}/")
 
-    stats = {"ok": 0, "aug": 0, "error": 0}
+    # ── Resume: load set ảnh gốc đã xử lý ───────────────────────
+    # Some older/partial documents may miss 'source_filename'. Use .get() and
+    # filter out None to avoid KeyError when building the resume set.
+    done_set = set()
+    for d in col_transformed.find({"is_augmented": False}, {"filename": 1, "_id": 0}):
+        fn = d.get("filename")
+        if fn:
+            done_set.add(os.path.splitext(fn)[0])
+    print(f"  Đã xử lý trước : {len(done_set):,} → skip")
 
-    for i, doc in enumerate(col_integrated.find(query, {"_id": 0}), 1):
+    stats = {"ok": 0, "aug": 0, "error": 0, "skip": len(done_set)}
+
+    for i, doc in enumerate(col_integrated.find({}, {"_id": 0}), 1):
         fname = doc.get("filename", "")
         label = doc.get("label", "unknown")
-        stem = os.path.splitext(fname)[0]
+        stem  = os.path.splitext(fname)[0]
 
-        # ── Tải ảnh từ MinIO raw (nguồn gốc) ────────────────────
-        raw_obj = f"{RAW_PREFIX}/{fname}"
+        # ── RESUME ───────────────────────────────────────────────
+        # done_set contains stems (filename without extension) of already
+        # transformed standard images. Compare by stem.
+        if stem in done_set:
+            continue
+
+        raw_obj = doc.get("object_name", f"{RAW_PREFIX}/{fname}")
+
+        # ── Tải ảnh gốc từ MinIO raw/ ────────────────────────────
         try:
-            resp = minio.client.get_object(MINIO_BUCKET, raw_obj)
-            raw = resp.read(); resp.close()
-            pil = Image.open(io.BytesIO(raw)).convert("RGB")
-            # capture original dimensions before any resize
-            orig_w, orig_h = pil.width, pil.height
+            img_rgb = load_rgb_from_minio(minio, raw_obj)
         except Exception as e:
-            print(f"  [!] Lỗi tải {fname} từ {raw_obj}: {e}")
+            print(f"\n  [!] Tải {fname}: {e}")
             stats["error"] += 1
             continue
 
-        # ── 1. Resize 640×640 ───────────────────────────────────
-        pil = resize_640(pil)
+        orig_h, orig_w = img_rgb.shape[:2]
 
-        # ── 2. Histogram Equalization ────────────────────────────
-        if HIST_EQ_ENABLED:
-            pil = hist_equalization(pil)
+        # ── BƯỚC 1: standard_pipeline (giống test2.py) ──────────
+        img_standard = STANDARD_PIPELINE(image=img_rgb)["image"]
+        # img_standard: RGB uint8 640×640, đã qua CLAHE
 
-        # ── 3. Tính normalization stats ─────────────────────────
-        norm = compute_norm_stats(pil)
+        # ── Normalization stats ───────────────────────────────────
+        norm_std = compute_norm_stats(img_standard)
 
-        # ── Upload vào preprocessed/ ────────────────────────────
-        preproc_obj = f"{PREPROC_PREFIX}/{label}/{stem}.png"
-        png_bytes = to_png_bytes(pil)
-
-        # If this object has already been recorded in images_transformed, skip
-        if col_transformed.find_one({"object_name": preproc_obj}):
-            # already processed (main image)
-            continue
-
+        # ── Upload ảnh standard vào MinIO ────────────────────────
+        main_obj = f"{PREPROC_PREFIX}/{label}/{stem}.png"
         try:
-            ok = upload_png(minio, preproc_obj, png_bytes)
-            if not ok:
-                stats["error"] += 1
-                continue
-            # Verify object exists
-            minio.client.stat_object(MINIO_BUCKET, preproc_obj)
+            if not upload_png(minio, main_obj, rgb_to_png_bytes(img_standard)):
+                raise RuntimeError("put_object False")
         except Exception as e:
-            print(f"  [!] Lỗi upload {preproc_obj}: {e}")
+            print(f"\n  [!] Upload {main_obj}: {e}")
             stats["error"] += 1
             continue
 
-        # ── Lưu document cho ảnh chính vào collection images_transformed ────
-        main_doc = {
-            # filename should match the stored object (preprocessed PNG basename)
-            "filename": os.path.basename(preproc_obj),
-            "parent_filename": None,
-            "label": label,
-            "object_name": preproc_obj,
-            "width_raw": orig_w if 'orig_w' in locals() else doc.get("width", 0),
-            "height_raw": orig_h if 'orig_h' in locals() else doc.get("height", 0),
-            "width": TARGET_SIZE[0],
-            "height": TARGET_SIZE[1],
-            "format": "PNG",
-            "is_augmented": False,
-            "aug_index": None,
-            "transformed": True,
-            "transformed_at": datetime.now().strftime("%Y-%m-%d"),
-            **norm,
-        }
-
+        # ── Lưu doc ảnh standard ─────────────────────────────────
         try:
-            col_transformed.insert_one(main_doc)
+            col_transformed.insert_one(build_doc(
+                fname_out=f"{stem}.png",
+                obj_name=main_obj,
+                label=label,
+                orig_w=orig_w, orig_h=orig_h,
+                norm=norm_std,
+                is_aug=False, aug_idx=None,
+            ))
             stats["ok"] += 1
         except Exception as e:
-            print(f"  [!] Lỗi lưu MongoDB (main) {fname}: {e}")
+            print(f"\n  [!] MongoDB main {fname}: {e}")
             stats["error"] += 1
+            continue
 
-        # ── 4. Augmentation → cùng thư mục preprocessed/ ───────
+        # ── BƯỚC 2: aug_pipeline (giống test2.py) ────────────────
         if AUGMENT_ENABLED:
-            for j in range(AUGMENT_PER_IMAGE):
-                aug_obj = f"{PREPROC_PREFIX}/{label}/{stem}_aug{j+1}.png"
-                aug_png = to_png_bytes(augment_one(pil))
+            for j in range(1, AUGMENT_PER_IMAGE + 1):
+                aug_obj = f"{PREPROC_PREFIX}/{label}/{stem}_aug{j}.png"
+
+                # Resume augmented: check transformed documents by augmented
+                # filename (stem_aug{j}.png) and aug_index
+                if col_transformed.find_one(
+                        {"filename": f"{stem}_aug{j}.png", "aug_index": j},
+                        {"_id": 1}):
+                    continue
+
+                # Áp dụng aug lên img_standard (đã chuẩn 640×640)
+                img_aug  = AUG_PIPELINE(image=img_standard)["image"]
+                norm_aug = compute_norm_stats(img_aug)
+
                 try:
-                    if upload_png(minio, aug_obj, aug_png):
-                        # Verify
-                        minio.client.stat_object(MINIO_BUCKET, aug_obj)
-                        
-                        # ── Lưu document riêng cho augmented ────────────────
-                        aug_doc = {
-                            "filename": os.path.basename(aug_obj),
-                            "parent_filename": os.path.basename(preproc_obj),
-                            "label": label,
-                            "object_name": aug_obj,
-                            "width_raw": orig_w if 'orig_w' in locals() else doc.get("width", 0),
-                            "height_raw": orig_h if 'orig_h' in locals() else doc.get("height", 0),
-                            "width": TARGET_SIZE[0],
-                            "height": TARGET_SIZE[1],
-                            "format": "PNG",
-                            "is_augmented": True,
-                            "aug_index": j + 1,
-                            "transformed": True,
-                            "transformed_at": datetime.now().strftime("%Y-%m-%d"),
-                            **norm,
-                        }
-                        # if augmented object already exists in DB, skip inserting/uploading
-                        if col_transformed.find_one({"object_name": aug_obj}):
-                            continue
-                        try:
-                            col_transformed.insert_one(aug_doc)
-                            stats["aug"] += 1
-                        except Exception as e:
-                            print(f"  [!] Lỗi lưu MongoDB (aug) {fname} aug{j+1}: {e}")
+                    if not upload_png(minio, aug_obj, rgb_to_png_bytes(img_aug)):
+                        raise RuntimeError("put_object False")
+                    col_transformed.insert_one(build_doc(
+                        fname_out=f"{stem}_aug{j}.png",
+                        obj_name=aug_obj,
+                        label=label,
+                        orig_w=orig_w, orig_h=orig_h,
+                        norm=norm_aug,
+                        is_aug=True, aug_idx=j,
+                    ))
+                    stats["aug"] += 1
                 except Exception:
                     pass
-        
-        # ── Đánh dấu integrated đã được transform ────────────────
-        # Note: do not modify the previous collection (images_integrated) here.
-        # Step 3 writes into images_transformed only. Status is determined
-        # by presence of documents in images_transformed (or features collection).
 
         if i % 100 == 0:
-            print(f"  {i}/{total} | OK={stats['ok']} Aug={stats['aug']}", end="\r")
+            print(
+                f"  [{i}/{total}] OK={stats['ok']} "
+                f"Aug={stats['aug']} Err={stats['error']}",
+                end="\r",
+            )
 
     print(f"""
-[Transformation] HOÀN THÀNH
-  Đã transform  : {stats['ok']:,} ảnh → 640×640 PNG
-  Augmentation  : {stats['aug']:,} ảnh mới
-  Lỗi           : {stats['error']:,}
-  Input         : {RAW_PREFIX}/
-  Output        : {PREPROC_PREFIX}/{{label}}/
-  Collection    : images_transformed
+[Transformation] HOÀN THÀNH  →  images_transformed
+  ┌──────────────────────────────────────────────────┐
+  │  Đã transform  : {stats['ok']:>6,} ảnh standard              │
+  │  Augmentation  : {stats['aug']:>6,} ảnh (×{AUGMENT_PER_IMAGE})                │
+  │  Bỏ qua (done) : {stats['skip']:>6,}                          │
+  │  Lỗi           : {stats['error']:>6,}                          │
+  └──────────────────────────────────────────────────┘
+  Pipeline: LongestMaxSize→PadGray→CLAHE + GaussBlur→HFlip→BC
 """)
     return stats
 
 
+# ================================================================
 if __name__ == "__main__":
-    print("=" * 55)
-    print("  STEP 3 – DATA TRANSFORMATION")
-    print("=" * 55)
+    print("=" * 60)
+    print("  STEP 3 – DATA TRANSFORMATION (Albumentations)")
+    print("  standard: LongestMaxSize + PadIfNeeded(gray) + CLAHE")
+    print("  aug     : GaussianBlur + HFlip + BrightnessContrast")
+    print("=" * 60)
     minio = MinioClient()
     mongo = MongoDBClient()
     run_transformation(minio, mongo)
