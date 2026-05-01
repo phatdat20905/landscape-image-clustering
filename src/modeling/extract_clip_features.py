@@ -61,7 +61,7 @@ def extract_clip_features(minio: MinioClient, mongo: MongoDBClient):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     model, preprocess = load_clip_model(device)
     
-    col_image_features = mongo.db["image_features"]
+    col_image_features = mongo.db["images_transformed"]
     col_clip_features = mongo.db["clip_features"]
     
     # Create index
